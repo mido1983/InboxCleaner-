@@ -1,0 +1,14 @@
+{
+  "name": "inboxcleaner",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "login": "clasp login",
+    "create": "clasp create --type addon --title \"InboxCleaner\" --rootDir ./src",
+    "push": "clasp push",
+    "open": "clasp open"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2"
+  }
+}
