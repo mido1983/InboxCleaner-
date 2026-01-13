@@ -11,6 +11,7 @@ var PREVIEW_LIMIT = 10;
 var MAX_PROCESS = 2000;
 var SLEEP_MS = 300;
 var EXCLUSIONS = '-is:starred -is:important';
+var USE_BATCH_TRASH = false;
 
 var PRESETS = {
   promotions: {
@@ -85,13 +86,17 @@ function buildHomeCard_() {
 
   var buttonSet = CardService.newButtonSet();
 
-  var previewAction = CardService.newAction().setFunctionName('handlePreview');
+  var previewAction = CardService.newAction()
+    .setFunctionName('handlePreview')
+    .setParameters({ dryRun: 'true' });
   var previewButton = CardService.newTextButton()
     .setText('Preview')
     .setOnClickAction(previewAction)
     .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
 
-  var cleanAction = CardService.newAction().setFunctionName('handleConfirm');
+  var cleanAction = CardService.newAction()
+    .setFunctionName('handleConfirm')
+    .setParameters({ dryRun: 'false' });
   var cleanButton = CardService.newTextButton()
     .setText('Clean now')
     .setOnClickAction(cleanAction);
@@ -227,7 +232,11 @@ function buildPreviewCard_(query, totalEstimate, items, mode, dryRun) {
     section.addWidget(CardService.newTextParagraph().setText('No messages found.'));
   } else {
     items.forEach(function(item) {
-      section.addWidget(CardService.newTextParagraph().setText(item));
+      var widget = CardService.newKeyValue()
+        .setTopLabel('From: ' + item.from)
+        .setContent(item.subject)
+        .setBottomLabel('Date: ' + item.date);
+      section.addWidget(widget);
     });
   }
 
@@ -319,12 +328,13 @@ function buildResultCard_(result) {
 function getQueryFromEvent_(e) {
   var params = e.parameters || {};
   var form = e.formInput || {};
+  var paramDryRun = params.dryRun !== undefined ? isTrue_(params.dryRun) : null;
 
   if (params.query) {
     return {
       query: params.query,
       mode: params.mode || DEFAULTS.MODE,
-      dryRun: isTrue_(params.dryRun)
+      dryRun: paramDryRun !== null ? paramDryRun : false
     };
   }
 
@@ -336,7 +346,7 @@ function getQueryFromEvent_(e) {
     return {
       query: preset.query + ' ' + EXCLUSIONS,
       mode: params.mode || DEFAULTS.MODE,
-      dryRun: isTrue_(params.dryRun)
+      dryRun: paramDryRun !== null ? paramDryRun : false
     };
   }
 
@@ -348,7 +358,9 @@ function getQueryFromEvent_(e) {
   var scope = form.scope || DEFAULTS.SCOPE;
   var age = form.age || DEFAULTS.AGE_DAYS;
   var mode = form.mode || DEFAULTS.MODE;
-  var dryRun = form.dryRun ? true : DEFAULTS.DRY_RUN;
+  var dryRun = paramDryRun !== null
+    ? paramDryRun
+    : (String(form.dryRun).toLowerCase() === 'true');
 
   return {
     query: buildQuery_(phrase, scope, age),
@@ -396,13 +408,13 @@ function safeGetMetadata_(id) {
     });
     var headers = msg.payload && msg.payload.headers ? msg.payload.headers : [];
 
-    var from = getHeader_(headers, 'From') || 'Unknown sender';
-    var subject = getHeader_(headers, 'Subject') || '(no subject)';
-    var date = getHeader_(headers, 'Date') || '';
+    var from = escapeHtml_(getHeader_(headers, 'From') || 'Unknown sender');
+    var subject = escapeHtml_(getHeader_(headers, 'Subject') || '(no subject)');
+    var date = escapeHtml_(getHeader_(headers, 'Date') || '');
 
-    return 'From: ' + escapeHtml_(from) + '<br>Subject: ' + escapeHtml_(subject) + '<br>Date: ' + escapeHtml_(date);
+    return { from: from, subject: subject, date: date };
   } catch (err) {
-    return 'Unable to load message metadata.';
+    return { from: 'Unknown sender', subject: 'Unable to load message metadata.', date: '' };
   }
 }
 
@@ -459,25 +471,26 @@ function processMessages_(ids, mode) {
         }, 'me');
         success += batch.length;
       } else {
-        Gmail.Users.Messages.batchModify({
-          ids: batch,
-          addLabelIds: ['TRASH']
-        }, 'me');
-        success += batch.length;
+        if (USE_BATCH_TRASH) {
+          Gmail.Users.Messages.batchModify({
+            ids: batch,
+            addLabelIds: ['TRASH']
+          }, 'me');
+          success += batch.length;
+        } else {
+          var trashResult = trashIndividually_(batch);
+          success += trashResult.success;
+          failed += trashResult.failed;
+          if (trashResult.error && errors.length < 3) {
+            errors.push(trashResult.error);
+          }
+        }
       }
     } catch (err) {
-      failed += batch.length;
       if (errors.length < 3) {
         errors.push(shortError_(err));
       }
-      if (mode !== 'ARCHIVE') {
-        var fallback = trashIndividually_(batch);
-        success += fallback.success;
-        failed -= fallback.success;
-        if (fallback.error && errors.length < 3) {
-          errors.push(fallback.error);
-        }
-      }
+      failed += batch.length;
     }
 
     Utilities.sleep(SLEEP_MS);
@@ -493,6 +506,7 @@ function processMessages_(ids, mode) {
 
 function trashIndividually_(batch) {
   var success = 0;
+  var failed = 0;
   var error = '';
   try {
     batch.forEach(function(id) {
@@ -500,17 +514,19 @@ function trashIndividually_(batch) {
         Gmail.Users.Messages.trash('me', id);
         success += 1;
       } catch (err) {
+        failed += 1;
         if (!error) {
           error = shortError_(err);
         }
       }
     });
   } catch (err) {
+    failed += batch.length;
     if (!error) {
       error = shortError_(err);
     }
   }
-  return { success: success, error: error };
+  return { success: success, failed: failed, error: error };
 }
 
 function shortError_(err) {

@@ -68,3 +68,5 @@ The scopes are defined in `src/appsscript.json`:
 - Messages are never permanently deleted. Trash or archive only.
 - Only message IDs and metadata headers are used.
 - The query always includes `-is:starred -is:important` exclusions.
+- Trash is performed using `Gmail.Users.Messages.trash` for reliability and may be slower.
+- Preview and counts are estimates from the Gmail API.
