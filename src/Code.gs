@@ -11,6 +11,7 @@ var PREVIEW_LIMIT = 10;
 var MAX_PROCESS = 2000;
 var MAX_PER_RUN = 300;
 var STATE_TTL_MIN = 30;
+var TIME_BUDGET_MS = 25000;
 var SLEEP_MS = 300;
 var EXCLUSIONS = '-is:starred -is:important';
 
@@ -66,6 +67,16 @@ function buildHomeCard_() {
     .addItem('180 days', '180', false)
     .addItem('All time', 'ALL', false);
 
+  var fromInput = CardService.newTextInput()
+    .setFieldName('from')
+    .setTitle('From (email or domain)')
+    .setHint('e.g., promo@site.com or @site.com');
+
+  var rawQueryInput = CardService.newTextInput()
+    .setFieldName('rawQuery')
+    .setTitle('Raw Gmail query (advanced)')
+    .setHint('e.g., from:@site.com has:attachment before:2024/01/01');
+
   var modeInput = CardService.newSelectionInput()
     .setType(CardService.SelectionInputType.DROPDOWN)
     .setTitle('Mode')
@@ -79,11 +90,20 @@ function buildHomeCard_() {
     .setSelected(true)
     .setControlType(CardService.SwitchControlType.SWITCH);
 
+  var autoContinueSwitch = CardService.newSwitch()
+    .setFieldName('autoContinue')
+    .setValue('true')
+    .setSelected(false)
+    .setControlType(CardService.SwitchControlType.SWITCH);
+
   inputSection.addWidget(phraseInput);
   inputSection.addWidget(scopeInput);
   inputSection.addWidget(ageInput);
+  inputSection.addWidget(fromInput);
+  inputSection.addWidget(rawQueryInput);
   inputSection.addWidget(modeInput);
   inputSection.addWidget(CardService.newKeyValue().setTopLabel('Preview only').setContent('Dry-run mode').setSwitch(dryRunSwitch));
+  inputSection.addWidget(CardService.newKeyValue().setTopLabel('Auto-continue').setContent('Process multiple batches per run').setSwitch(autoContinueSwitch));
   inputSection.addWidget(CardService.newTextParagraph().setText('Exclusions always on: -is:starred -is:important'));
 
   var buttonSet = CardService.newButtonSet();
@@ -152,6 +172,7 @@ function handlePreview(e) {
   var query = queryBuild.query;
   var mode = queryBuild.mode;
   var dryRun = queryBuild.dryRun;
+  var autoContinue = queryBuild.autoContinue;
 
   var listResp = safeList_(query, PREVIEW_LIMIT);
   var totalEstimate = listResp.total;
@@ -161,7 +182,7 @@ function handlePreview(e) {
     return safeGetMetadata_(id);
   });
 
-  return buildPreviewCard_(query, totalEstimate, items, mode, dryRun);
+  return buildPreviewCard_(query, totalEstimate, items, mode, dryRun, autoContinue);
 }
 
 function handleConfirm(e) {
@@ -173,13 +194,14 @@ function handleConfirm(e) {
   var query = queryBuild.query;
   var mode = queryBuild.mode;
   var dryRun = queryBuild.dryRun;
+  var autoContinue = queryBuild.autoContinue;
 
   var listResp = safeList_(query, PREVIEW_LIMIT);
   var totalEstimate = listResp.total;
   var capped = totalEstimate > MAX_PROCESS;
   var effectiveCount = Math.min(totalEstimate, MAX_PROCESS);
 
-  return buildConfirmCard_(query, effectiveCount, capped, mode, dryRun);
+  return buildConfirmCard_(query, effectiveCount, capped, mode, dryRun, autoContinue);
 }
 
 function handleExecute(e) {
@@ -191,6 +213,10 @@ function handleExecute(e) {
   var dryRun = isTrue_(params.dryRun);
   var pageToken = state && state.pageToken ? state.pageToken : null;
   var processedTotal = state && state.processedTotal ? state.processedTotal : 0;
+  var totalEstimate = state && state.totalEstimate ? state.totalEstimate : 0;
+  var autoContinue = state && state.autoContinue !== undefined
+    ? state.autoContinue
+    : isTrue_(params.autoContinue);
 
   if (!query) {
     return buildValidationResponse_('Missing query. Return to the home card and try again.');
@@ -203,6 +229,7 @@ function handleExecute(e) {
       dryRun: true,
       processedThisRun: 0,
       processedTotal: 0,
+      totalEstimate: 0,
       success: 0,
       failed: 0,
       capped: false,
@@ -214,25 +241,61 @@ function handleExecute(e) {
     stateId = Utilities.getUuid();
   }
 
-  var listResp = listMessageIds_(query, MAX_PER_RUN, pageToken);
-  var ids = listResp.ids;
+  var startTime = Date.now();
+  var result = { processed: 0, success: 0, failed: 0, errors: [] };
+  var nextPageToken = pageToken;
+  var capped = false;
 
-  var result = processMessages_(ids, mode);
-  processedTotal += result.processed;
+  do {
+    var listResp = listMessageIds_(query, MAX_PER_RUN, nextPageToken);
+    var ids = listResp.ids;
+    capped = listResp.capped;
+    if (!totalEstimate) {
+      totalEstimate = listResp.totalEstimate || 0;
+    }
+
+    if (!ids.length) {
+      nextPageToken = listResp.nextPageToken;
+      break;
+    }
+
+    var batchResult = processMessages_(ids, mode);
+    result.processed += batchResult.processed;
+    result.success += batchResult.success;
+    result.failed += batchResult.failed;
+    batchResult.errors.forEach(function(err) {
+      if (result.errors.length < 3) {
+        result.errors.push(err);
+      }
+    });
+
+    processedTotal += batchResult.processed;
+    nextPageToken = listResp.nextPageToken;
+
+    if (!nextPageToken) {
+      break;
+    }
+    if (!autoContinue) {
+      break;
+    }
+  } while (Date.now() - startTime < TIME_BUDGET_MS);
 
   result.query = query;
   result.mode = mode;
   result.dryRun = false;
-  result.capped = listResp.capped;
+  result.capped = capped;
   result.processedThisRun = result.processed;
   result.processedTotal = processedTotal;
+  result.totalEstimate = totalEstimate;
 
-  if (listResp.nextPageToken) {
+  if (nextPageToken) {
     saveRunState_(stateId, {
       query: query,
       mode: mode,
-      pageToken: listResp.nextPageToken,
-      processedTotal: processedTotal
+      pageToken: nextPageToken,
+      processedTotal: processedTotal,
+      totalEstimate: totalEstimate,
+      autoContinue: autoContinue
     });
     result.hasMore = true;
     result.stateId = stateId;
@@ -244,7 +307,7 @@ function handleExecute(e) {
   return buildResultCard_(result);
 }
 
-function buildPreviewCard_(query, totalEstimate, items, mode, dryRun) {
+function buildPreviewCard_(query, totalEstimate, items, mode, dryRun, autoContinue) {
   var card = CardService.newCardBuilder();
   card.setHeader(CardService.newCardHeader().setTitle('Preview'));
 
@@ -275,7 +338,8 @@ function buildPreviewCard_(query, totalEstimate, items, mode, dryRun) {
     .setParameters({
       query: query,
       mode: mode,
-      dryRun: dryRun ? 'true' : 'false'
+      dryRun: dryRun ? 'true' : 'false',
+      autoContinue: autoContinue ? 'true' : 'false'
     });
 
   var cleanButton = CardService.newTextButton()
@@ -290,7 +354,7 @@ function buildPreviewCard_(query, totalEstimate, items, mode, dryRun) {
   return card.build();
 }
 
-function buildConfirmCard_(query, count, capped, mode, dryRun) {
+function buildConfirmCard_(query, count, capped, mode, dryRun, autoContinue) {
   var card = CardService.newCardBuilder();
   card.setHeader(CardService.newCardHeader().setTitle('Confirm'));
 
@@ -317,7 +381,8 @@ function buildConfirmCard_(query, count, capped, mode, dryRun) {
     .setParameters({
       query: query,
       mode: mode,
-      dryRun: dryRun ? 'true' : 'false'
+      dryRun: dryRun ? 'true' : 'false',
+      autoContinue: autoContinue ? 'true' : 'false'
     });
 
   var confirmButton = CardService.newTextButton()
@@ -341,9 +406,12 @@ function buildResultCard_(result) {
   }
 
   var actionLabel = result.mode === 'ARCHIVE' ? 'archived' : 'trashed';
+  var totalEstimate = result.totalEstimate || 0;
   section.addWidget(CardService.newTextParagraph().setText('Query: ' + result.query));
+  section.addWidget(CardService.newTextParagraph().setText('Estimated total matches: ' + totalEstimate));
   section.addWidget(CardService.newTextParagraph().setText('Processed this run: ' + result.processedThisRun));
   section.addWidget(CardService.newTextParagraph().setText('Processed total: ' + result.processedTotal));
+  section.addWidget(CardService.newTextParagraph().setText('Remaining (est): ' + Math.max(totalEstimate - result.processedTotal, 0)));
   section.addWidget(CardService.newTextParagraph().setText('Successfully ' + actionLabel + ': ' + result.success));
   section.addWidget(CardService.newTextParagraph().setText('Failed: ' + result.failed));
 
@@ -374,12 +442,14 @@ function getQueryFromEvent_(e) {
   var params = e.parameters || {};
   var form = e.formInput || {};
   var paramDryRun = params.dryRun !== undefined ? isTrue_(params.dryRun) : null;
+  var paramAutoContinue = params.autoContinue !== undefined ? isTrue_(params.autoContinue) : null;
 
   if (params.query) {
     return {
       query: params.query,
       mode: params.mode || DEFAULTS.MODE,
-      dryRun: paramDryRun !== null ? paramDryRun : false
+      dryRun: paramDryRun !== null ? paramDryRun : false,
+      autoContinue: paramAutoContinue !== null ? paramAutoContinue : false
     };
   }
 
@@ -391,13 +461,9 @@ function getQueryFromEvent_(e) {
     return {
       query: preset.query + ' ' + EXCLUSIONS,
       mode: params.mode || DEFAULTS.MODE,
-      dryRun: paramDryRun !== null ? paramDryRun : false
+      dryRun: paramDryRun !== null ? paramDryRun : false,
+      autoContinue: paramAutoContinue !== null ? paramAutoContinue : false
     };
-  }
-
-  var phrase = (form.phrase || '').trim();
-  if (!phrase) {
-    return { error: 'Phrase is required.' };
   }
 
   var scope = form.scope || DEFAULTS.SCOPE;
@@ -406,21 +472,46 @@ function getQueryFromEvent_(e) {
   var dryRun = paramDryRun !== null
     ? paramDryRun
     : (String(form.dryRun).toLowerCase() === 'true');
+  var autoContinue = paramAutoContinue !== null
+    ? paramAutoContinue
+    : (String(form.autoContinue).toLowerCase() === 'true');
+
+  var queryBuild = buildQueryFromInputs_({
+    phrase: form.phrase,
+    scope: scope,
+    age: age,
+    from: form.from,
+    rawQuery: form.rawQuery
+  });
+  if (queryBuild.error) {
+    return { error: queryBuild.error };
+  }
 
   return {
-    query: buildQuery_(phrase, scope, age),
+    query: queryBuild.query,
     mode: mode,
-    dryRun: dryRun
+    dryRun: dryRun,
+    autoContinue: autoContinue
   };
 }
 
-function buildQuery_(phrase, scope, age) {
-  var safePhrase = escapeQuery_(phrase);
-  var core = scope === 'SUBJECT' ? 'subject:"' + safePhrase + '"' : '"' + safePhrase + '"';
-  if (!age || age === 'ALL') {
-    return core + ' ' + EXCLUSIONS;
+function buildQueryFromInputs_(form) {
+  var rawQuery = (form.rawQuery || '').trim();
+  if (rawQuery) {
+    return { query: rawQuery, isRaw: true };
   }
-  return core + ' older_than:' + age + 'd ' + EXCLUSIONS;
+
+  var phrase = (form.phrase || '').trim();
+  if (!phrase) {
+    return { error: 'Phrase is required.' };
+  }
+
+  var safePhrase = escapeQuery_(phrase);
+  var core = form.scope === 'SUBJECT' ? 'subject:"' + safePhrase + '"' : '"' + safePhrase + '"';
+  var fromValue = (form.from || '').trim();
+  var fromClause = fromValue ? ' from:' + fromValue : '';
+  var ageClause = (!form.age || form.age === 'ALL') ? '' : ' older_than:' + form.age + 'd';
+  return { query: core + fromClause + ageClause + ' ' + EXCLUSIONS, isRaw: false };
 }
 
 function escapeQuery_(text) {
@@ -478,6 +569,7 @@ function listMessageIds_(query, maxCount, pageToken) {
   var capped = false;
   var token = pageToken || null;
   var nextPageToken = null;
+  var totalEstimate = 0;
 
   do {
     var resp = Gmail.Users.Messages.list('me', {
@@ -485,6 +577,10 @@ function listMessageIds_(query, maxCount, pageToken) {
       maxResults: LIST_PAGE_SIZE,
       pageToken: token
     });
+
+    if (!totalEstimate && resp && resp.resultSizeEstimate !== undefined) {
+      totalEstimate = resp.resultSizeEstimate || 0;
+    }
 
     if (resp && resp.messages) {
       resp.messages.forEach(function(m) {
@@ -502,7 +598,7 @@ function listMessageIds_(query, maxCount, pageToken) {
     token = nextPageToken;
   } while (token);
 
-  return { ids: ids, nextPageToken: nextPageToken, capped: capped };
+  return { ids: ids, nextPageToken: nextPageToken, capped: capped, totalEstimate: totalEstimate };
 }
 
 function processMessages_(ids, mode) {
@@ -595,6 +691,8 @@ function saveRunState_(stateId, state) {
     mode: state.mode,
     pageToken: state.pageToken,
     processedTotal: state.processedTotal,
+    totalEstimate: state.totalEstimate,
+    autoContinue: state.autoContinue,
     updatedAt: Date.now()
   };
   props.setProperty('run_' + stateId, JSON.stringify(payload));
