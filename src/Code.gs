@@ -9,9 +9,10 @@ var BATCH_SIZE = 100;
 var LIST_PAGE_SIZE = 500;
 var PREVIEW_LIMIT = 10;
 var MAX_PROCESS = 2000;
+var MAX_PER_RUN = 300;
+var STATE_TTL_MIN = 30;
 var SLEEP_MS = 300;
 var EXCLUSIONS = '-is:starred -is:important';
-var USE_BATCH_TRASH = false;
 
 var PRESETS = {
   promotions: {
@@ -62,7 +63,8 @@ function buildHomeCard_() {
     .addItem('14 days', '14', true)
     .addItem('30 days', '30', false)
     .addItem('90 days', '90', false)
-    .addItem('180 days', '180', false);
+    .addItem('180 days', '180', false)
+    .addItem('All time', 'ALL', false);
 
   var modeInput = CardService.newSelectionInput()
     .setType(CardService.SelectionInputType.DROPDOWN)
@@ -181,9 +183,14 @@ function handleConfirm(e) {
 }
 
 function handleExecute(e) {
-  var query = e.parameters && e.parameters.query ? e.parameters.query : '';
-  var mode = e.parameters && e.parameters.mode ? e.parameters.mode : DEFAULTS.MODE;
-  var dryRun = isTrue_(e.parameters && e.parameters.dryRun);
+  var params = e.parameters || {};
+  var stateId = params.stateId || '';
+  var state = stateId ? loadRunState_(stateId) : null;
+  var query = state && state.query ? state.query : (params.query || '');
+  var mode = state && state.mode ? state.mode : (params.mode || DEFAULTS.MODE);
+  var dryRun = isTrue_(params.dryRun);
+  var pageToken = state && state.pageToken ? state.pageToken : null;
+  var processedTotal = state && state.processedTotal ? state.processedTotal : 0;
 
   if (!query) {
     return buildValidationResponse_('Missing query. Return to the home card and try again.');
@@ -194,7 +201,8 @@ function handleExecute(e) {
       query: query,
       mode: mode,
       dryRun: true,
-      processed: 0,
+      processedThisRun: 0,
+      processedTotal: 0,
       success: 0,
       failed: 0,
       capped: false,
@@ -202,15 +210,36 @@ function handleExecute(e) {
     });
   }
 
-  var listResp = listMessageIds_(query, MAX_PROCESS);
+  if (!stateId) {
+    stateId = Utilities.getUuid();
+  }
+
+  var listResp = listMessageIds_(query, MAX_PER_RUN, pageToken);
   var ids = listResp.ids;
-  var capped = listResp.capped;
 
   var result = processMessages_(ids, mode);
+  processedTotal += result.processed;
+
   result.query = query;
   result.mode = mode;
   result.dryRun = false;
-  result.capped = capped;
+  result.capped = listResp.capped;
+  result.processedThisRun = result.processed;
+  result.processedTotal = processedTotal;
+
+  if (listResp.nextPageToken) {
+    saveRunState_(stateId, {
+      query: query,
+      mode: mode,
+      pageToken: listResp.nextPageToken,
+      processedTotal: processedTotal
+    });
+    result.hasMore = true;
+    result.stateId = stateId;
+  } else {
+    clearRunState_(stateId);
+    result.hasMore = false;
+  }
 
   return buildResultCard_(result);
 }
@@ -275,6 +304,10 @@ function buildConfirmCard_(query, count, capped, mode, dryRun) {
   section.addWidget(CardService.newTextParagraph().setText('You are about to ' + actionLabel + ' ' + count + ' messages.'));
   section.addWidget(CardService.newTextParagraph().setText('Query: ' + query));
 
+  if (query.indexOf('older_than:') === -1) {
+    section.addWidget(CardService.newTextParagraph().setText('All time can require multiple runs. Use Continue until finished.'));
+  }
+
   if (capped) {
     section.addWidget(CardService.newTextParagraph().setText('Only the first ' + MAX_PROCESS + ' messages will be processed. Run again to continue.'));
   }
@@ -309,7 +342,8 @@ function buildResultCard_(result) {
 
   var actionLabel = result.mode === 'ARCHIVE' ? 'archived' : 'trashed';
   section.addWidget(CardService.newTextParagraph().setText('Query: ' + result.query));
-  section.addWidget(CardService.newTextParagraph().setText('Processed: ' + result.processed));
+  section.addWidget(CardService.newTextParagraph().setText('Processed this run: ' + result.processedThisRun));
+  section.addWidget(CardService.newTextParagraph().setText('Processed total: ' + result.processedTotal));
   section.addWidget(CardService.newTextParagraph().setText('Successfully ' + actionLabel + ': ' + result.success));
   section.addWidget(CardService.newTextParagraph().setText('Failed: ' + result.failed));
 
@@ -319,6 +353,17 @@ function buildResultCard_(result) {
 
   if (result.errors && result.errors.length) {
     section.addWidget(CardService.newTextParagraph().setText('Errors: ' + result.errors.join(' | ')));
+  }
+
+  if (result.hasMore && result.stateId) {
+    var continueAction = CardService.newAction()
+      .setFunctionName('handleExecute')
+      .setParameters({ stateId: result.stateId });
+    var continueButton = CardService.newTextButton()
+      .setText('Continue')
+      .setOnClickAction(continueAction)
+      .setTextButtonStyle(CardService.TextButtonStyle.FILLED);
+    section.addWidget(continueButton);
   }
 
   card.addSection(section);
@@ -372,6 +417,9 @@ function getQueryFromEvent_(e) {
 function buildQuery_(phrase, scope, age) {
   var safePhrase = escapeQuery_(phrase);
   var core = scope === 'SUBJECT' ? 'subject:"' + safePhrase + '"' : '"' + safePhrase + '"';
+  if (!age || age === 'ALL') {
+    return core + ' ' + EXCLUSIONS;
+  }
   return core + ' older_than:' + age + 'd ' + EXCLUSIONS;
 }
 
@@ -425,16 +473,17 @@ function getHeader_(headers, name) {
   return match ? match.value : '';
 }
 
-function listMessageIds_(query, maxCount) {
+function listMessageIds_(query, maxCount, pageToken) {
   var ids = [];
-  var pageToken = null;
   var capped = false;
+  var token = pageToken || null;
+  var nextPageToken = null;
 
   do {
     var resp = Gmail.Users.Messages.list('me', {
       q: query,
       maxResults: LIST_PAGE_SIZE,
-      pageToken: pageToken
+      pageToken: token
     });
 
     if (resp && resp.messages) {
@@ -445,14 +494,15 @@ function listMessageIds_(query, maxCount) {
       });
     }
 
-    pageToken = resp.nextPageToken;
+    nextPageToken = resp.nextPageToken;
     if (ids.length >= maxCount) {
       capped = true;
       break;
     }
-  } while (pageToken);
+    token = nextPageToken;
+  } while (token);
 
-  return { ids: ids, capped: capped };
+  return { ids: ids, nextPageToken: nextPageToken, capped: capped };
 }
 
 function processMessages_(ids, mode) {
@@ -471,26 +521,26 @@ function processMessages_(ids, mode) {
         }, 'me');
         success += batch.length;
       } else {
-        if (USE_BATCH_TRASH) {
-          Gmail.Users.Messages.batchModify({
-            ids: batch,
-            addLabelIds: ['TRASH']
-          }, 'me');
-          success += batch.length;
-        } else {
-          var trashResult = trashIndividually_(batch);
-          success += trashResult.success;
-          failed += trashResult.failed;
-          if (trashResult.error && errors.length < 3) {
-            errors.push(trashResult.error);
-          }
-        }
+        Gmail.Users.Messages.batchModify({
+          ids: batch,
+          addLabelIds: ['TRASH']
+        }, 'me');
+        success += batch.length;
       }
     } catch (err) {
       if (errors.length < 3) {
         errors.push(shortError_(err));
       }
-      failed += batch.length;
+      if (mode === 'ARCHIVE') {
+        failed += batch.length;
+      } else {
+        var trashFallback = trashIndividually_(batch);
+        success += trashFallback.success;
+        failed += trashFallback.failed;
+        if (trashFallback.error && errors.length < 3) {
+          errors.push(trashFallback.error);
+        }
+      }
     }
 
     Utilities.sleep(SLEEP_MS);
@@ -536,6 +586,45 @@ function shortError_(err) {
 
 function isTrue_(value) {
   return String(value).toLowerCase() === 'true';
+}
+
+function saveRunState_(stateId, state) {
+  var props = PropertiesService.getUserProperties();
+  var payload = {
+    query: state.query,
+    mode: state.mode,
+    pageToken: state.pageToken,
+    processedTotal: state.processedTotal,
+    updatedAt: Date.now()
+  };
+  props.setProperty('run_' + stateId, JSON.stringify(payload));
+}
+
+function loadRunState_(stateId) {
+  var props = PropertiesService.getUserProperties();
+  var raw = props.getProperty('run_' + stateId);
+  if (!raw) {
+    return null;
+  }
+  try {
+    var state = JSON.parse(raw);
+    if (STATE_TTL_MIN && state.updatedAt) {
+      var ageMs = Date.now() - state.updatedAt;
+      if (ageMs > STATE_TTL_MIN * 60 * 1000) {
+        clearRunState_(stateId);
+        return null;
+      }
+    }
+    return state;
+  } catch (err) {
+    clearRunState_(stateId);
+    return null;
+  }
+}
+
+function clearRunState_(stateId) {
+  var props = PropertiesService.getUserProperties();
+  props.deleteProperty('run_' + stateId);
 }
 
 function buildValidationResponse_(message) {
