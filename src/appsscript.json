@@ -12,8 +12,9 @@
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8",
   "oauthScopes": [
-    "https://www.googleapis.com/auth/gmail.addons.execute",
-    "https://www.googleapis.com/auth/gmail.modify"
+ "https://www.googleapis.com/auth/gmail.addons.execute",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/script.locale"
   ],
   "addOns": {
     "common": {
