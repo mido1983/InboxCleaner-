@@ -43,6 +43,7 @@ function buildHomeCard_() {
   card.setHeader(CardService.newCardHeader().setTitle('InboxCleaner'));
 
   var inputSection = CardService.newCardSection().setHeader('Delete what contains');
+  var lastEstimate = getLastEstimate_();
 
   var phraseInput = CardService.newTextInput()
     .setFieldName('phrase')
@@ -70,7 +71,7 @@ function buildHomeCard_() {
   var fromInput = CardService.newTextInput()
     .setFieldName('from')
     .setTitle('From (email or domain)')
-    .setHint('e.g., promo@site.com or @site.com');
+    .setHint('e.g., do-not-reply@site.com or @site.com');
 
   var rawQueryInput = CardService.newTextInput()
     .setFieldName('rawQuery')
@@ -90,6 +91,12 @@ function buildHomeCard_() {
     .setSelected(true)
     .setControlType(CardService.SwitchControlType.SWITCH);
 
+  var exactPhraseSwitch = CardService.newSwitch()
+    .setFieldName('exactPhrase')
+    .setValue('true')
+    .setSelected(false)
+    .setControlType(CardService.SwitchControlType.SWITCH);
+
   var autoContinueSwitch = CardService.newSwitch()
     .setFieldName('autoContinue')
     .setValue('true')
@@ -102,9 +109,11 @@ function buildHomeCard_() {
   inputSection.addWidget(fromInput);
   inputSection.addWidget(rawQueryInput);
   inputSection.addWidget(modeInput);
+  inputSection.addWidget(CardService.newKeyValue().setTopLabel('Exact phrase (use quotes)').setContent('Off by default').setSwitch(exactPhraseSwitch));
   inputSection.addWidget(CardService.newKeyValue().setTopLabel('Preview only').setContent('Dry-run mode').setSwitch(dryRunSwitch));
   inputSection.addWidget(CardService.newKeyValue().setTopLabel('Auto-continue').setContent('Process multiple batches per run').setSwitch(autoContinueSwitch));
   inputSection.addWidget(CardService.newTextParagraph().setText('Exclusions always on: -is:starred -is:important'));
+  inputSection.addWidget(CardService.newTextParagraph().setText('Last estimate: ' + lastEstimate));
 
   var buttonSet = CardService.newButtonSet();
 
@@ -129,6 +138,7 @@ function buildHomeCard_() {
 
   card.addSection(inputSection);
   card.addSection(buildPresetsSection_());
+  card.addSection(buildQaSection_());
 
   return card.build();
 }
@@ -163,6 +173,16 @@ function buildPresetsSection_() {
   return section;
 }
 
+function buildQaSection_() {
+  var section = CardService.newCardSection().setHeader('QA');
+  var qaAction = CardService.newAction().setFunctionName('handleRunQa');
+  var qaButton = CardService.newTextButton()
+    .setText('Run QA tests')
+    .setOnClickAction(qaAction);
+  section.addWidget(qaButton);
+  return section;
+}
+
 function handlePreview(e) {
   var queryBuild = getQueryFromEvent_(e);
   if (queryBuild.error) {
@@ -176,6 +196,7 @@ function handlePreview(e) {
 
   var listResp = safeList_(query, PREVIEW_LIMIT);
   var totalEstimate = listResp.total;
+  setLastEstimate_(totalEstimate);
   var ids = listResp.ids;
 
   var items = ids.map(function(id) {
@@ -198,6 +219,7 @@ function handleConfirm(e) {
 
   var listResp = safeList_(query, PREVIEW_LIMIT);
   var totalEstimate = listResp.total;
+  setLastEstimate_(totalEstimate);
   var capped = totalEstimate > MAX_PROCESS;
   var effectiveCount = Math.min(totalEstimate, MAX_PROCESS);
 
@@ -475,13 +497,15 @@ function getQueryFromEvent_(e) {
   var autoContinue = paramAutoContinue !== null
     ? paramAutoContinue
     : (String(form.autoContinue).toLowerCase() === 'true');
+  var exactPhrase = String(form.exactPhrase).toLowerCase() === 'true';
 
   var queryBuild = buildQueryFromInputs_({
     phrase: form.phrase,
     scope: scope,
     age: age,
     from: form.from,
-    rawQuery: form.rawQuery
+    rawQuery: form.rawQuery,
+    exactPhrase: exactPhrase
   });
   if (queryBuild.error) {
     return { error: queryBuild.error };
@@ -502,16 +526,26 @@ function buildQueryFromInputs_(form) {
   }
 
   var phrase = (form.phrase || '').trim();
-  if (!phrase) {
-    return { error: 'Phrase is required.' };
+  var fromValue = (form.from || '').trim();
+  if (!phrase && !fromValue) {
+    return { error: 'Provide Phrase and/or From, or use Raw query.' };
   }
 
-  var safePhrase = escapeQuery_(phrase);
-  var core = form.scope === 'SUBJECT' ? 'subject:"' + safePhrase + '"' : '"' + safePhrase + '"';
-  var fromValue = (form.from || '').trim();
+  var phrasePart = '';
+  if (phrase) {
+    if (form.exactPhrase) {
+      var exact = '"' + escapeQuery_(phrase) + '"';
+      phrasePart = form.scope === 'SUBJECT' ? 'subject:' + exact : exact;
+    } else {
+      phrasePart = form.scope === 'SUBJECT' ? 'subject:' + phrase : phrase;
+    }
+  }
+
   var fromClause = fromValue ? ' from:' + fromValue : '';
   var ageClause = (!form.age || form.age === 'ALL') ? '' : ' older_than:' + form.age + 'd';
-  return { query: core + fromClause + ageClause + ' ' + EXCLUSIONS, isRaw: false };
+  var base = phrasePart ? phrasePart : '';
+  var query = (base + fromClause + ageClause).trim() + ' ' + EXCLUSIONS;
+  return { query: query, isRaw: false };
 }
 
 function escapeQuery_(text) {
@@ -698,6 +732,17 @@ function saveRunState_(stateId, state) {
   props.setProperty('run_' + stateId, JSON.stringify(payload));
 }
 
+function getLastEstimate_() {
+  var props = PropertiesService.getUserProperties();
+  var value = props.getProperty('LAST_ESTIMATE');
+  return value ? value : '-';
+}
+
+function setLastEstimate_(value) {
+  var props = PropertiesService.getUserProperties();
+  props.setProperty('LAST_ESTIMATE', String(value));
+}
+
 function loadRunState_(stateId) {
   var props = PropertiesService.getUserProperties();
   var raw = props.getProperty('run_' + stateId);
@@ -723,6 +768,105 @@ function loadRunState_(stateId) {
 function clearRunState_(stateId) {
   var props = PropertiesService.getUserProperties();
   props.deleteProperty('run_' + stateId);
+}
+
+function handleRunQa(e) {
+  var results = [];
+
+  var t1 = buildQueryFromInputs_({
+    phrase: 'unsubscribe',
+    scope: 'ANY',
+    age: '14',
+    from: '',
+    rawQuery: '',
+    exactPhrase: false
+  });
+  results.push(assertTest_(
+    'Phrase only, non-exact',
+    !t1.error &&
+      t1.query.indexOf('unsubscribe') !== -1 &&
+      t1.query.indexOf('\"unsubscribe\"') === -1 &&
+      t1.query.indexOf('older_than:14d') !== -1 &&
+      t1.query.indexOf(EXCLUSIONS) !== -1 &&
+      t1.query.indexOf('from:') === -1
+  ));
+
+  var t2 = buildQueryFromInputs_({
+    phrase: 'do "not" reply',
+    scope: 'ANY',
+    age: '14',
+    from: '',
+    rawQuery: '',
+    exactPhrase: true
+  });
+  results.push(assertTest_(
+    'Phrase only, exact',
+    !t2.error && t2.query.indexOf('"do \\"not\\" reply"') !== -1
+  ));
+
+  var t3 = buildQueryFromInputs_({
+    phrase: '',
+    scope: 'ANY',
+    age: 'ALL',
+    from: '@site.com',
+    rawQuery: '',
+    exactPhrase: false
+  });
+  results.push(assertTest_(
+    'From only, all time',
+    !t3.error &&
+      t3.query.indexOf('from:@site.com') !== -1 &&
+      t3.query.indexOf('older_than:') === -1 &&
+      t3.query.indexOf(EXCLUSIONS) !== -1 &&
+      t3.query.indexOf('""') === -1
+  ));
+
+  var t4 = buildQueryFromInputs_({
+    phrase: 'invoice',
+    scope: 'SUBJECT',
+    age: '30',
+    from: 'billing@site.com',
+    rawQuery: '',
+    exactPhrase: false
+  });
+  results.push(assertTest_(
+    'Phrase plus from',
+    !t4.error &&
+      t4.query.indexOf('subject:invoice') !== -1 &&
+      t4.query.indexOf('from:billing@site.com') !== -1 &&
+      t4.query.indexOf('older_than:30d') !== -1 &&
+      t4.query.indexOf(EXCLUSIONS) !== -1
+  ));
+
+  var t5 = buildQueryFromInputs_({
+    phrase: '',
+    scope: 'ANY',
+    age: '14',
+    from: '',
+    rawQuery: '',
+    exactPhrase: false
+  });
+  results.push(assertTest_(
+    'Missing phrase and from',
+    !!t5.error
+  ));
+
+  var card = CardService.newCardBuilder();
+  card.setHeader(CardService.newCardHeader().setTitle('QA Results'));
+
+  var section = CardService.newCardSection();
+  var passed = results.filter(function(r) { return r.pass; }).length;
+  section.addWidget(CardService.newTextParagraph().setText('Summary: ' + passed + '/' + results.length + ' passed'));
+  results.forEach(function(r) {
+    section.addWidget(CardService.newTextParagraph().setText((r.pass ? 'PASS: ' : 'FAIL: ') + r.name));
+  });
+
+  card.addSection(section);
+  return card.build();
+}
+
+function assertTest_(name, condition) {
+  return { name: name, pass: !!condition };
 }
 
 function buildValidationResponse_(message) {
