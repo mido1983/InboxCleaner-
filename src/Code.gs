@@ -14,6 +14,8 @@ var STATE_TTL_MIN = 30;
 var TIME_BUDGET_MS = 25000;
 var SLEEP_MS = 300;
 var EXCLUSIONS = '-is:starred -is:important';
+var QA_SAFE_MODE = true;
+var QA_CONTEXT = null;
 
 var PRESETS = {
   promotions: {
@@ -175,10 +177,16 @@ function buildPresetsSection_() {
 
 function buildQaSection_() {
   var section = CardService.newCardSection().setHeader('QA');
+  var verboseSwitch = CardService.newSwitch()
+    .setFieldName('qaVerbose')
+    .setValue('true')
+    .setSelected(false)
+    .setControlType(CardService.SwitchControlType.SWITCH);
   var qaAction = CardService.newAction().setFunctionName('handleRunQa');
   var qaButton = CardService.newTextButton()
     .setText('Run QA tests')
     .setOnClickAction(qaAction);
+  section.addWidget(CardService.newKeyValue().setTopLabel('Verbose QA').setContent('Show more details').setSwitch(verboseSwitch));
   section.addWidget(qaButton);
   return section;
 }
@@ -239,6 +247,10 @@ function handleExecute(e) {
   var autoContinue = state && state.autoContinue !== undefined
     ? state.autoContinue
     : isTrue_(params.autoContinue);
+
+  if (isQaMode_() && QA_SAFE_MODE) {
+    dryRun = true;
+  }
 
   if (!query) {
     return buildValidationResponse_('Missing query. Return to the home card and try again.');
@@ -376,6 +388,10 @@ function buildPreviewCard_(query, totalEstimate, items, mode, dryRun, autoContin
   return card.build();
 }
 
+function confirmWarningNeeded_(query) {
+  return query.indexOf('older_than:') === -1;
+}
+
 function buildConfirmCard_(query, count, capped, mode, dryRun, autoContinue) {
   var card = CardService.newCardBuilder();
   card.setHeader(CardService.newCardHeader().setTitle('Confirm'));
@@ -390,7 +406,7 @@ function buildConfirmCard_(query, count, capped, mode, dryRun, autoContinue) {
   section.addWidget(CardService.newTextParagraph().setText('You are about to ' + actionLabel + ' ' + count + ' messages.'));
   section.addWidget(CardService.newTextParagraph().setText('Query: ' + query));
 
-  if (query.indexOf('older_than:') === -1) {
+  if (confirmWarningNeeded_(query)) {
     section.addWidget(CardService.newTextParagraph().setText('All time can require multiple runs. Use Continue until finished.'));
   }
 
@@ -488,8 +504,7 @@ function getQueryFromEvent_(e) {
     };
   }
 
-  var scope = form.scope || DEFAULTS.SCOPE;
-  var age = form.age || DEFAULTS.AGE_DAYS;
+  var inputs = parseInputs_(form);
   var mode = form.mode || DEFAULTS.MODE;
   var dryRun = paramDryRun !== null
     ? paramDryRun
@@ -497,16 +512,8 @@ function getQueryFromEvent_(e) {
   var autoContinue = paramAutoContinue !== null
     ? paramAutoContinue
     : (String(form.autoContinue).toLowerCase() === 'true');
-  var exactPhrase = String(form.exactPhrase).toLowerCase() === 'true';
 
-  var queryBuild = buildQueryFromInputs_({
-    phrase: form.phrase,
-    scope: scope,
-    age: age,
-    from: form.from,
-    rawQuery: form.rawQuery,
-    exactPhrase: exactPhrase
-  });
+  var queryBuild = buildQuery_(inputs);
   if (queryBuild.error) {
     return { error: queryBuild.error };
   }
@@ -519,40 +526,100 @@ function getQueryFromEvent_(e) {
   };
 }
 
-function buildQueryFromInputs_(form) {
-  var rawQuery = (form.rawQuery || '').trim();
-  if (rawQuery) {
-    return { query: rawQuery, isRaw: true };
+function parseInputs_(form) {
+  return {
+    phrase: (form.phrase || '').trim(),
+    from: (form.from || '').trim(),
+    rawQuery: (form.rawQuery || '').trim(),
+    scope: form.scope || DEFAULTS.SCOPE,
+    age: form.age || DEFAULTS.AGE_DAYS,
+    exactPhrase: String(form.exactPhrase).toLowerCase() === 'true'
+  };
+}
+
+function buildQuery_(inputs) {
+  if (inputs.rawQuery) {
+    return { query: inputs.rawQuery, isRaw: true };
   }
 
-  var phrase = (form.phrase || '').trim();
-  var fromValue = (form.from || '').trim();
-  if (!phrase && !fromValue) {
+  if (!inputs.phrase && !inputs.from) {
     return { error: 'Provide Phrase and/or From, or use Raw query.' };
   }
 
-  var phrasePart = '';
-  if (phrase) {
-    if (form.exactPhrase) {
-      var exact = '"' + escapeQuery_(phrase) + '"';
-      phrasePart = form.scope === 'SUBJECT' ? 'subject:' + exact : exact;
-    } else {
-      phrasePart = form.scope === 'SUBJECT' ? 'subject:' + phrase : phrase;
-    }
+  var parts = [];
+  if (inputs.phrase) {
+    var phraseValue = inputs.exactPhrase ? '"' + escapeQuery_(inputs.phrase) + '"' : inputs.phrase;
+    var phrasePart = inputs.scope === 'SUBJECT' ? 'subject:' + phraseValue : phraseValue;
+    parts.push(phrasePart);
+  }
+  if (inputs.from) {
+    parts.push('from:' + inputs.from);
+  }
+  if (!inputs.age || inputs.age === 'ALL') {
+    parts.push('in:anywhere');
+  } else {
+    parts.push('older_than:' + inputs.age + 'd');
   }
 
-  var fromClause = fromValue ? ' from:' + fromValue : '';
-  var ageClause = (!form.age || form.age === 'ALL') ? '' : ' older_than:' + form.age + 'd';
-  var base = phrasePart ? phrasePart : '';
-  var query = (base + fromClause + ageClause).trim() + ' ' + EXCLUSIONS;
-  return { query: query, isRaw: false };
+  return { query: parts.join(' ') + ' ' + EXCLUSIONS, isRaw: false };
+}
+
+function buildQueryFromInputs_(form) {
+  return buildQuery_(parseInputs_(form));
 }
 
 function escapeQuery_(text) {
   return text.replace(/"/g, '\\"');
 }
 
+function isQaMode_() {
+  return QA_CONTEXT && QA_CONTEXT.enabled;
+}
+
+function qaTrackCall_(name) {
+  if (QA_CONTEXT && QA_CONTEXT.calls) {
+    QA_CONTEXT.calls[name] = (QA_CONTEXT.calls[name] || 0) + 1;
+  }
+}
+
+function qaHash_(text) {
+  var hash = 0;
+  for (var i = 0; i < text.length; i++) {
+    hash = (hash * 31 + text.charCodeAt(i)) % 100000;
+  }
+  return hash;
+}
+
+function qaMockList_(query, maxResults, pageToken) {
+  qaTrackCall_('list');
+  var total = (qaHash_(query) % 400) + 50;
+  var start = pageToken ? parseInt(pageToken, 10) : 0;
+  if (isNaN(start)) {
+    start = 0;
+  }
+  var ids = [];
+  for (var i = 0; i < maxResults && start + i < total; i++) {
+    ids.push({ id: 'qa-' + (start + i) });
+  }
+  var nextPageToken = start + maxResults < total ? String(start + maxResults) : null;
+  return { messages: ids, resultSizeEstimate: total, nextPageToken: nextPageToken };
+}
+
+function qaMockMetadata_(id) {
+  qaTrackCall_('get');
+  return {
+    from: 'qa-sender-' + id + '@example.com',
+    subject: 'QA Subject ' + id,
+    date: '2024-01-01'
+  };
+}
+
 function safeList_(query, maxResults) {
+  if (isQaMode_()) {
+    var mockResp = qaMockList_(query, maxResults, null);
+    var mockIds = mockResp.messages.map(function(m) { return m.id; });
+    return { ids: mockIds, total: mockResp.resultSizeEstimate || 0 };
+  }
   try {
     var resp = Gmail.Users.Messages.list('me', {
       q: query,
@@ -574,6 +641,9 @@ function safeList_(query, maxResults) {
 }
 
 function safeGetMetadata_(id) {
+  if (isQaMode_()) {
+    return qaMockMetadata_(id);
+  }
   try {
     var msg = Gmail.Users.Messages.get('me', id, {
       format: 'metadata',
@@ -599,6 +669,9 @@ function getHeader_(headers, name) {
 }
 
 function listMessageIds_(query, maxCount, pageToken) {
+  if (isQaMode_()) {
+    return qaListMessageIds_(query, maxCount, pageToken);
+  }
   var ids = [];
   var capped = false;
   var token = pageToken || null;
@@ -635,7 +708,41 @@ function listMessageIds_(query, maxCount, pageToken) {
   return { ids: ids, nextPageToken: nextPageToken, capped: capped, totalEstimate: totalEstimate };
 }
 
+function qaListMessageIds_(query, maxCount, pageToken) {
+  var ids = [];
+  var capped = false;
+  var token = pageToken || null;
+  var nextPageToken = null;
+  var totalEstimate = 0;
+
+  do {
+    var resp = qaMockList_(query, LIST_PAGE_SIZE, token);
+    if (!totalEstimate && resp && resp.resultSizeEstimate !== undefined) {
+      totalEstimate = resp.resultSizeEstimate || 0;
+    }
+    if (resp && resp.messages) {
+      resp.messages.forEach(function(m) {
+        if (ids.length < maxCount) {
+          ids.push(m.id);
+        }
+      });
+    }
+    nextPageToken = resp.nextPageToken;
+    if (ids.length >= maxCount) {
+      capped = true;
+      break;
+    }
+    token = nextPageToken;
+  } while (token);
+
+  return { ids: ids, nextPageToken: nextPageToken, capped: capped, totalEstimate: totalEstimate };
+}
+
 function processMessages_(ids, mode) {
+  if (isQaMode_() && QA_SAFE_MODE) {
+    qaTrackCall_('process');
+    return { processed: ids.length, success: ids.length, failed: 0, errors: [] };
+  }
   var success = 0;
   var failed = 0;
   var errors = [];
@@ -771,102 +878,286 @@ function clearRunState_(stateId) {
 }
 
 function handleRunQa(e) {
+  var verbose = isTrue_(e && e.formInput && e.formInput.qaVerbose);
+  QA_CONTEXT = { enabled: true, safe: QA_SAFE_MODE, verbose: verbose, calls: { list: 0, get: 0, process: 0 } };
+  try {
+    var results = [];
+    results = results.concat(qaRunUnitTests_());
+    results = results.concat(qaRunIntegrationTests_());
+    return qaBuildResultsCard_(results, QA_CONTEXT);
+  } finally {
+    QA_CONTEXT = null;
+  }
+}
+
+function qaRunUnitTests_() {
   var results = [];
 
-  var t1 = buildQueryFromInputs_({
-    phrase: 'unsubscribe',
+  var rawOverride = buildQuery_(parseInputs_({
+    phrase: 'ignored',
     scope: 'ANY',
     age: '14',
-    from: '',
-    rawQuery: '',
-    exactPhrase: false
-  });
-  results.push(assertTest_(
-    'Phrase only, non-exact',
-    !t1.error &&
-      t1.query.indexOf('unsubscribe') !== -1 &&
-      t1.query.indexOf('\"unsubscribe\"') === -1 &&
-      t1.query.indexOf('older_than:14d') !== -1 &&
-      t1.query.indexOf(EXCLUSIONS) !== -1 &&
-      t1.query.indexOf('from:') === -1
-  ));
+    from: 'sender@site.com',
+    rawQuery: 'from:@site.com has:attachment',
+    exactPhrase: true
+  }));
+  results.push(qaAssertEquals_('Raw query overrides inputs', rawOverride.query, 'from:@site.com has:attachment'));
 
-  var t2 = buildQueryFromInputs_({
+  var exactQuote = buildQuery_(parseInputs_({
     phrase: 'do "not" reply',
     scope: 'ANY',
     age: '14',
     from: '',
     rawQuery: '',
     exactPhrase: true
-  });
-  results.push(assertTest_(
-    'Phrase only, exact',
-    !t2.error && t2.query.indexOf('"do \\"not\\" reply"') !== -1
-  ));
+  }));
+  results.push(qaAssertContains_('Exact phrase escapes quotes', exactQuote.query, '"do \\"not\\" reply"'));
 
-  var t3 = buildQueryFromInputs_({
-    phrase: '',
-    scope: 'ANY',
-    age: 'ALL',
-    from: '@site.com',
-    rawQuery: '',
-    exactPhrase: false
-  });
-  results.push(assertTest_(
-    'From only, all time',
-    !t3.error &&
-      t3.query.indexOf('from:@site.com') !== -1 &&
-      t3.query.indexOf('older_than:') === -1 &&
-      t3.query.indexOf(EXCLUSIONS) !== -1 &&
-      t3.query.indexOf('""') === -1
-  ));
-
-  var t4 = buildQueryFromInputs_({
-    phrase: 'invoice',
-    scope: 'SUBJECT',
-    age: '30',
-    from: 'billing@site.com',
-    rawQuery: '',
-    exactPhrase: false
-  });
-  results.push(assertTest_(
-    'Phrase plus from',
-    !t4.error &&
-      t4.query.indexOf('subject:invoice') !== -1 &&
-      t4.query.indexOf('from:billing@site.com') !== -1 &&
-      t4.query.indexOf('older_than:30d') !== -1 &&
-      t4.query.indexOf(EXCLUSIONS) !== -1
-  ));
-
-  var t5 = buildQueryFromInputs_({
-    phrase: '',
+  var nonAscii = buildQuery_(parseInputs_({
+    phrase: 'שלום',
     scope: 'ANY',
     age: '14',
     from: '',
     rawQuery: '',
     exactPhrase: false
-  });
-  results.push(assertTest_(
-    'Missing phrase and from',
-    !!t5.error
-  ));
+  }));
+  results.push(qaAssertContains_('Non-ASCII phrase preserved', nonAscii.query, 'שלום'));
 
+  var apostrophe = buildQuery_(parseInputs_({
+    phrase: "Papa's",
+    scope: 'ANY',
+    age: '14',
+    from: '',
+    rawQuery: '',
+    exactPhrase: false
+  }));
+  results.push(qaAssertContains_('Apostrophe phrase preserved', apostrophe.query, "Papa's"));
+
+  var presets = Object.keys(PRESETS).map(function(key) { return { key: key, preset: PRESETS[key] }; });
+  presets.forEach(function(preset) {
+    var preview = getQueryFromEvent_({ parameters: { presetId: preset.key, dryRun: 'true', mode: 'TRASH' } });
+    results.push(qaAssertEquals_('Preset preview dryRun: ' + preset.key, String(preview.dryRun), 'true'));
+    results.push(qaAssertEquals_('Preset preview query: ' + preset.key, preview.query, preset.preset.query + ' ' + EXCLUSIONS));
+
+    var clean = getQueryFromEvent_({ parameters: { presetId: preset.key, dryRun: 'false', mode: 'TRASH' } });
+    results.push(qaAssertEquals_('Preset clean dryRun: ' + preset.key, String(clean.dryRun), 'false'));
+    results.push(qaAssertEquals_('Preset clean query: ' + preset.key, clean.query, preset.preset.query + ' ' + EXCLUSIONS));
+  });
+
+  var matrixPhrases = ['', 'alpha', 'beta gamma'];
+  var froms = ['', 'sender@site.com', '@site.com', 'site.com'];
+  var ages = ['7', '14', '30', '90', '180', 'ALL'];
+  var scopes = ['ANY', 'SUBJECT'];
+  var exactFlags = [false, true];
+  var matrixCount = 0;
+
+  matrixPhrases.forEach(function(phrase) {
+    froms.forEach(function(fromValue) {
+      ages.forEach(function(age) {
+        var scopeSet = phrase ? scopes : ['ANY'];
+        var exactSet = phrase ? exactFlags : [false];
+        scopeSet.forEach(function(scope) {
+          exactSet.forEach(function(exactPhrase) {
+            var inputs = {
+              phrase: phrase,
+              from: fromValue,
+              rawQuery: '',
+              scope: scope,
+              age: age,
+              exactPhrase: exactPhrase
+            };
+            var result = buildQuery_(inputs);
+            var check = qaCheckQuery_(inputs, result);
+            matrixCount += 1;
+            results.push(qaResult_('Matrix ' + matrixCount, check.pass, check.details));
+          });
+        });
+      });
+    });
+  });
+
+  var rawQueries = [
+    'from:@site.com has:attachment',
+    'subject:(invoice OR receipt) before:2024/01/01'
+  ];
+  rawQueries.forEach(function(raw) {
+    var inputs = {
+      phrase: 'ignored words',
+      from: 'ignored@site.com',
+      rawQuery: raw,
+      scope: 'SUBJECT',
+      age: '7',
+      exactPhrase: true
+    };
+    var result = buildQuery_(inputs);
+    results.push(qaAssertEquals_('Raw query verbatim: ' + raw, result.query, raw));
+  });
+
+  return results;
+}
+
+function qaRunIntegrationTests_() {
+  var results = [];
+
+  results.push(qaAssertTrue_('Home card renders', !!buildHomeCard_(), 'buildHomeCard_ returned null'));
+
+  QA_CONTEXT.calls.list = 0;
+  QA_CONTEXT.calls.get = 0;
+  var previewEvent = {
+    formInput: {
+      phrase: 'alpha',
+      scope: 'ANY',
+      age: '14',
+      from: '',
+      rawQuery: '',
+      exactPhrase: 'false',
+      dryRun: 'true',
+      autoContinue: 'false'
+    }
+  };
+  var previewCard = handlePreview(previewEvent);
+  results.push(qaAssertTrue_('Preview card renders', !!previewCard, 'handlePreview returned null'));
+  results.push(qaAssertTrue_('Preview invokes list', QA_CONTEXT.calls.list > 0, 'safeList_ not called'));
+  results.push(qaAssertTrue_('Preview invokes metadata', QA_CONTEXT.calls.get > 0, 'safeGetMetadata_ not called'));
+
+  var expectedTotal = qaExpectedTotal_('alpha older_than:14d ' + EXCLUSIONS);
+  results.push(qaAssertEquals_('Last estimate stored', getLastEstimate_(), String(expectedTotal)));
+
+  var inputsAll = parseInputs_({
+    phrase: 'alpha',
+    scope: 'ANY',
+    age: 'ALL',
+    from: '',
+    rawQuery: '',
+    exactPhrase: 'false'
+  });
+  var queryAll = buildQuery_(inputsAll);
+  results.push(qaAssertTrue_('Confirm warning for All time', confirmWarningNeeded_(queryAll.query), 'Expected warning for All time'));
+
+  QA_CONTEXT.calls.process = 0;
+  var executeCard = handleExecute({ parameters: { query: 'alpha', mode: 'TRASH', dryRun: 'false', autoContinue: 'false' } });
+  results.push(qaAssertTrue_('Execute card renders', !!executeCard, 'handleExecute returned null'));
+  results.push(qaAssertTrue_('Execute respects QA safe mode', QA_CONTEXT.calls.process === 0, 'processMessages_ was called'));
+
+  return results;
+}
+
+function qaCheckQuery_(inputs, result) {
+  var problems = [];
+
+  if (inputs.rawQuery) {
+    if (result.query !== inputs.rawQuery.trim()) {
+      problems.push('raw query mismatch');
+    }
+    return { pass: problems.length === 0, details: problems.join('; ') };
+  }
+
+  if (!inputs.phrase && !inputs.from) {
+    if (!result.error) {
+      problems.push('expected validation error');
+    }
+    return { pass: problems.length === 0, details: problems.join('; ') };
+  }
+
+  if (result.error) {
+    problems.push('unexpected error');
+    return { pass: false, details: problems.join('; ') };
+  }
+
+  var q = result.query;
+  if (inputs.phrase) {
+    var phraseValue = inputs.exactPhrase ? '"' + escapeQuery_(inputs.phrase) + '"' : inputs.phrase;
+    if (inputs.scope === 'SUBJECT') {
+      if (q.indexOf('subject:' + phraseValue) === -1) {
+        problems.push('missing subject phrase');
+      }
+    } else if (q.indexOf(phraseValue) === -1) {
+      problems.push('missing phrase');
+    }
+    if (!inputs.exactPhrase && inputs.phrase.indexOf(' ') !== -1) {
+      if (q.indexOf('"' + inputs.phrase + '"') !== -1) {
+        problems.push('unexpected quotes');
+      }
+    }
+  } else if (q.indexOf('subject:') !== -1) {
+    problems.push('unexpected subject clause');
+  }
+
+  if (inputs.from && q.indexOf('from:' + inputs.from) === -1) {
+    problems.push('missing from');
+  }
+
+  if (!inputs.age || inputs.age === 'ALL') {
+    if (q.indexOf('older_than:') !== -1) {
+      problems.push('unexpected age filter');
+    }
+    if (q.indexOf('in:anywhere') === -1) {
+      problems.push('missing in:anywhere');
+    }
+  } else if (q.indexOf('older_than:' + inputs.age + 'd') === -1) {
+    problems.push('missing age filter');
+  }
+
+  if (q.indexOf(EXCLUSIONS) === -1) {
+    problems.push('missing exclusions');
+  }
+
+  return { pass: problems.length === 0, details: problems.join('; ') };
+}
+
+function qaBuildResultsCard_(results, context) {
   var card = CardService.newCardBuilder();
   card.setHeader(CardService.newCardHeader().setTitle('QA Results'));
 
-  var section = CardService.newCardSection();
   var passed = results.filter(function(r) { return r.pass; }).length;
+  var failed = results.length - passed;
+  var section = CardService.newCardSection();
   section.addWidget(CardService.newTextParagraph().setText('Summary: ' + passed + '/' + results.length + ' passed'));
-  results.forEach(function(r) {
-    section.addWidget(CardService.newTextParagraph().setText((r.pass ? 'PASS: ' : 'FAIL: ') + r.name));
-  });
+  section.addWidget(CardService.newTextParagraph().setText('Calls - list: ' + context.calls.list + ', get: ' + context.calls.get + ', process: ' + context.calls.process));
+  section.addWidget(CardService.newTextParagraph().setText('QA safe mode: ' + (QA_SAFE_MODE ? 'ON' : 'OFF')));
+
+  var failures = results.filter(function(r) { return !r.pass; }).slice(0, 20);
+  if (failures.length) {
+    failures.forEach(function(r) {
+      section.addWidget(CardService.newTextParagraph().setText('FAIL: ' + r.name + (r.details ? ' - ' + r.details : '')));
+    });
+  } else {
+    section.addWidget(CardService.newTextParagraph().setText('All tests passed.'));
+  }
+
+  if (context.verbose) {
+    var passes = results.filter(function(r) { return r.pass; }).slice(0, 20);
+    passes.forEach(function(r) {
+      section.addWidget(CardService.newTextParagraph().setText('PASS: ' + r.name));
+    });
+  }
 
   card.addSection(section);
   return card.build();
 }
 
-function assertTest_(name, condition) {
-  return { name: name, pass: !!condition };
+function qaResult_(name, pass, details) {
+  return { name: name, pass: pass, details: details || '' };
+}
+
+function qaAssertEquals_(name, actual, expected) {
+  var pass = actual === expected;
+  var details = pass ? '' : 'expected "' + expected + '" got "' + actual + '"';
+  return qaResult_(name, pass, details);
+}
+
+function qaAssertContains_(name, actual, substring) {
+  var pass = actual.indexOf(substring) !== -1;
+  var details = pass ? '' : 'missing "' + substring + '"';
+  return qaResult_(name, pass, details);
+}
+
+function qaAssertTrue_(name, condition, details) {
+  return qaResult_(name, !!condition, condition ? '' : (details || 'assertion failed'));
+}
+
+function qaExpectedTotal_(query) {
+  return (qaHash_(query) % 400) + 50;
 }
 
 function buildValidationResponse_(message) {
